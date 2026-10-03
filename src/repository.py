@@ -54,6 +54,19 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS report_intake (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    station TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    client_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_intake_pending
+                    ON report_intake(event_id, station) WHERE status = 'pending';
+                CREATE INDEX IF NOT EXISTS idx_intake_event
+                    ON report_intake(event_id, status);
             """)
 
     @staticmethod
@@ -195,6 +208,87 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    @staticmethod
+    def _intake_from_row(row):
+        return {
+            "id": row["id"],
+            "event_id": row["event_id"],
+            "station": row["station"],
+            "payload": json.loads(row["payload"]),
+            "client_key": row["client_key"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+        }
+
+    def create_intake(self, event_id, station, payload, client_key):
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO report_intake(event_id, station, payload, client_key, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'pending', ?)",
+                (
+                    event_id,
+                    station,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    client_key,
+                    utcnow(),
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM report_intake WHERE event_id = ? AND station = ? AND status = 'pending'",
+                (event_id, station),
+            ).fetchone()
+        return self._intake_from_row(row) if row else None
+
+    def list_intake(self, event_id, status=None):
+        clauses = ["event_id = ?"]
+        params = [event_id]
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM report_intake" + where + " ORDER BY id", params
+            ).fetchall()
+        return [self._intake_from_row(row) for row in rows]
+
+    def commit_supplement(self, event_id, expected_version, status, data, intake_ids):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version FROM entities WHERE id = ?", (event_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + event_id)
+            current_version = int(row["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (status, payload, now, event_id, current_version),
+            )
+            if intake_ids:
+                placeholders = ",".join("?" for _ in intake_ids)
+                connection.execute(
+                    "UPDATE report_intake SET status = 'accepted' WHERE id IN (%s)"
+                    % placeholders,
+                    intake_ids,
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(event_id)
 
     def ping(self):
         with self._connect() as connection:

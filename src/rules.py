@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -19,6 +19,9 @@ def _validate_event(actor, data, lookup):
         raise ValidationError("event requires at least two station reports")
     if not data.get("title"):
         raise ValidationError("event title is required")
+    data.setdefault("report_version", 1)
+    data.setdefault("review", None)
+    data.setdefault("publication", None)
 
 
 def _validate_associate(actor, entity, data, lookup):
@@ -26,6 +29,54 @@ def _validate_associate(actor, entity, data, lookup):
     if len(reports) < 2:
         raise ValidationError("two reports are required for association")
     return {"associated_count": len(reports)}
+
+
+def _validate_review(actor, entity, data, lookup):
+    reports = entity["data"].get("reports") or []
+    amplitudes = []
+    for report in reports:
+        for value in report.get("amplitudes") or []:
+            amplitudes.append(float(value))
+    if amplitudes:
+        return {
+            "magnitude": round(magnitude_median(amplitudes), 4),
+            "magnitude_source": "computed",
+        }
+    magnitude = data.get("magnitude")
+    if magnitude is None:
+        raise ValidationError("magnitude is required when reports have no amplitudes")
+    return {"magnitude": float(magnitude), "magnitude_source": "manual"}
+
+
+def _validate_publish(actor, entity, data, lookup):
+    communication_id = data.get("communication_id")
+    if not communication_id:
+        raise ValidationError("communication_id is required")
+    report_version = int(entity["data"].get("report_version", 1))
+    return {
+        "publication": {
+            "communication_id": communication_id,
+            "report_version": report_version,
+            "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    }
+
+
+def _validate_supplement(actor, entity, data, lookup):
+    reports = data.get("reports") or []
+    if not reports:
+        raise ValidationError("supplement requires at least one report")
+    for report in reports:
+        station = report.get("station")
+        if not station:
+            raise ValidationError("report station is required")
+        if actor.role == "station":
+            owned = lookup("station", "code", station) or []
+            if not any(item.get("created_by") == actor.user_id for item in owned):
+                raise PermissionDenied(
+                    "station %s is not owned by %s" % (station, actor.user_id)
+                )
+    return {}
 
 
 def associate_reports(reports, max_delta=120, max_distance=3.0):
@@ -50,17 +101,17 @@ def magnitude_median(amplitudes):
 
 
 CUSTOM_CREATE = {'station': _validate_station, 'event': _validate_event}
-CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate}
+CUSTOM_TRANSITIONS = {('event', 'associate'): _validate_associate, ('event', 'review'): _validate_review, ('event', 'publish'): _validate_publish, ('event', 'supplement'): _validate_supplement}
 
 
 class RuleEngine:
     ALIASES = {'stations': 'station', 'events': 'event'}
     INITIAL_STATUS = {'station': 'online', 'event': 'candidate'}
-    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn')}}
+    TRANSITIONS = {'station': {'offline': (('online',), 'offline'), 'online': (('offline',), 'online')}, 'event': {'associate': (('candidate',), 'associated'), 'review': (('associated',), 'reviewed'), 'publish': (('reviewed',), 'published'), 'revise': (('published', 'revised'), 'revised'), 'withdraw': (('published', 'revised'), 'withdrawn'), 'supplement': (('associated', 'reviewed', 'published', 'revised'), 'associated'), 'reconcile': (('associated', 'published', 'revised'), 'published')}}
     CREATE_REQUIRED = {'station': ('code', 'lat', 'lon'), 'event': ('title', 'origin_time', 'location', 'reports')}
-    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer', 'magnitude'), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',)}
+    ACTION_REQUIRED = {('station', 'offline'): ('reason',), ('event', 'review'): ('reviewer',), ('event', 'publish'): ('communication_id',), ('event', 'revise'): ('reason', 'magnitude'), ('event', 'withdraw'): ('reason',), ('event', 'supplement'): ('reports',), ('event', 'reconcile'): ('communication_id',)}
     CREATE_ROLES = {'station': ('admin', 'station'), 'event': ('admin', 'analyst')}
-    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer')}
+    ROLE_ACTIONS = {'offline': ('admin', 'station'), 'online': ('admin', 'station'), 'associate': ('admin', 'analyst'), 'review': ('admin', 'reviewer'), 'publish': ('admin', 'reviewer'), 'revise': ('admin', 'reviewer'), 'withdraw': ('admin', 'reviewer'), 'supplement': ('admin', 'analyst', 'station'), 'reconcile': ('admin', 'reviewer')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

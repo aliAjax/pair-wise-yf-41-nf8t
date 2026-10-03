@@ -24,7 +24,11 @@ python3 app.py --db ./data.db --port 8307
 
 ## 核心对象
 
-- `station`：观测台站；`event`：地震事件及其多个修订版本。
+- `station`：观测台站；`event`：地震事件及其多个修订版本；观测报告内联在事件的 `reports` 集合中。
+- 事件维护 `report_version`（报告集合版本）、`review`（当前复核结论）和 `publication`（发布记录）。补报会令 `report_version` 加一，旧复核结论立即作废，震级在复核时由报告振幅中位数（`magnitude_median`）重算；无振幅时则要求人工录入震级。
+- 补报（`supplement`）走乐观锁：请求需带 `expected_version`，并发补报只认最新一版，过期版本返回 `409 Conflict`。写入失败的报告进入待重试队列（`report_intake`），重试按台站 upsert，台站数不重复计入。
+- 台站角色只能补本报台站的报告（按台站 `created_by` 校验），越权补报直接 `403`。
+- 发布后通过 `reconcile` 与通信编号对账：事件当前 `report_version` 与发布记录不一致时，一律退回待复核（`associated`）。
 
 ## 主要接口
 
@@ -33,7 +37,9 @@ python3 app.py --db ./data.db --port 8307
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
-- `GET /api/audit`：读取审计记录。
+  - 事件支持 `associate` / `review` / `publish` / `revise` / `withdraw` / `supplement` / `reconcile`。
+  - `supplement` 的 `data.reports` 为补报列表；`reconcile` 的 `data.communication_id` 为通信编号。
+- `GET /api/audit`：读取审计记录，旧复核结论与对账结果均留痕可查。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。
 
