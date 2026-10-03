@@ -85,6 +85,11 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts[:2] == ["api", "pending"]:
+                    event_id = parts[2] if len(parts) == 3 else None
+                    return self._send(
+                        200, {"items": service.list_pending(event_id=event_id)}
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -116,7 +121,14 @@ def create_handler(service, rules, static_dir):
                     expected = body.pop("expected_version", None)
                     return self._send(
                         200,
-                        service.transition(actor, parts[2], action, data, expected),
+                        service.transition(
+                            actor,
+                            parts[2],
+                            action,
+                            data,
+                            expected,
+                            self.headers.get("Idempotency-Key"),
+                        ),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
                     body = self._body()
@@ -131,6 +143,7 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
